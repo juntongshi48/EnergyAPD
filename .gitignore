@@ -1,0 +1,7 @@
+**.out
+**.pyc
+
+results/
+
+exp/launch.sh
+exp/batched_eval.sh

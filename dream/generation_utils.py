@@ -677,11 +677,13 @@ class DreamGenerationMixin:
                 
                 verifier_past_key_values = verifier_outputs.past_key_values
                 
-                 
+                
                 if is_prefilling:
                     verifier_logits = verifier_outputs.logits[:, curr_idx-1:-1, :] #shift logits
+                    verifier_logits = verifier_logits[:, :, :151936]   # truncate special tokens
                 else:
                     verifier_logits = verifier_outputs.logits
+                    verifier_logits = verifier_logits[:, :, :151936]   # truncate special tokens
                     verifier_logits = torch.cat([prev_logits, verifier_logits[:, :-1, :]], dim=1)
                 
                 if max_lookahead is not None:    

@@ -35,7 +35,6 @@ def get_model(args):
     task_name = args.task
 
     logger.info(f"Configuring model details for alias: {model_alias}")
-
     if model_alias == "qwen7b":
         if args.qwen_7b_ckpt is None:
             raise ValueError("--qwen_7b_ckpt is required when --model_alias=qwen7b")
@@ -55,6 +54,11 @@ def get_model(args):
                                                torch_dtype=torch.bfloat16, 
                                                device_map="cuda")
         tokenizer = AutoTokenizer.from_pretrained(args.dream_ckpt, trust_remote_code=True)
+        verifier_ckpt = None
+        if args.verifier_size =='small':
+            verifier_ckpt = args.qwen_small_ckpt
+        elif args.verifier_size == 'large':
+            verifier_ckpt = args.qwen_7b_ckpt
         model = DreamEvalHarness(
             pretrained=dream,
             tokenizer=tokenizer,
@@ -65,7 +69,7 @@ def get_model(args):
             apd_mixture_weight=apd_mixture_weight,
             num_steps=num_steps,
             max_gen_toks=512 if task_name=="math" else 256,
-            verifier_ckpt=args.qwen_small_ckpt,
+            verifier_ckpt=verifier_ckpt,
         )
         
     elif model_alias == "llada":
@@ -118,6 +122,16 @@ def main():
     parser.add_argument("--kv_window", type=int, default=None, help="APD Parameter W")
     parser.add_argument("--max_lookahead", type=int, default=None, help="APD Parameter M")
     parser.add_argument("--apd_mixture_weight", type=float, default=None, help="APD Parameter R")
+    parser.add_argument(
+        "--verifier_size", 
+        type=str, 
+        default="small", 
+        help="Size of AR verifier",
+        choices=["small","large"]
+    )
+    parser.add_argument("--temperature", type=float, default=None)
+    parser.add_argument("--top_p", type=float, default=None)
+    parser.add_argument("--max_gen_len", type=int, default=16384)
     
     parser.add_argument(
         "--num_steps",
@@ -164,6 +178,14 @@ def main():
         task_str += f"_R={args.apd_mixture_weight}"
     if args.num_steps is not None:
         task_str += f"_num_steps={args.num_steps}"
+    if args.verifier_size is not None and args.alg=='apd':
+        task_str += f"_ar{args.verifier_size}"
+    if args.temperature is not None:
+        task_str += f"_temp{args.temperature}"
+    if args.top_p is not None:
+        task_str += f"_topp{args.top_p}"
+    if args.max_gen_len != 16384:
+        task_str += f"_genlen{args.max_gen_len}"
     if args.tag:
         task_str += f"_{args.tag}"
     output_filename = f"{args.model_alias}_{task_str}_limit{args.limit}.json"
@@ -185,6 +207,19 @@ def main():
 
     task = [TASKS[task_name]]
     
+    gen_kwargs = None
+    if "qwen" in args.model_alias:
+        gen_kwargs = ""
+        do_sample = False
+        if args.temperature is not None:
+            gen_kwargs += f"temperature={args.temperature},"
+            do_sample = True
+        if args.top_p is not None:
+            gen_kwargs += f"top_p={args.top_p},"
+            do_sample = True
+        gen_kwargs += f"do_sample={do_sample},"
+        gen_kwargs += f"max_new_tokens={args.max_gen_len},"
+    
     results = evaluator.simple_evaluate(
         model=model,
         tasks=task,
@@ -195,7 +230,7 @@ def main():
         num_fewshot=0, 
         apply_chat_template=True,
         system_instruction=system_instruction,
-        gen_kwargs="max_length=16384" if "qwen" in args.model_alias else None,
+        gen_kwargs=gen_kwargs,
         confirm_run_unsafe_code=True
     )
 

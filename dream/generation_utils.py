@@ -36,6 +36,8 @@ logger = logging.get_logger(__name__)
 
 import time
 
+N_PARALELS_SAMPLES = 1
+
 
 def top_p_logits(logits, top_p=None):
     sorted_logits, sorted_indices = torch.sort(logits, descending=True)
@@ -136,6 +138,20 @@ def apd_accept_criterion(x, diffusion_logits, verifier_logits, gumbel_noise, apd
     accept[:, 0] = 1
     accept = torch.cumprod(accept, dim=-1)
     return accept
+
+def energy_resample(x0, accept, num_accept, diffusion_logits, verifier_logits):
+    p_theta = torch.gather(diffusion_logits, dim=-1, index=x0.unsqueeze(-1)).squeeze(-1) #(K, seqlen)
+    p_theta = (p_theta*accept).sum(-1) / num_accept
+    p_verifier = torch.gather(verifier_logits, dim=-1, index=x0.unsqueeze(-1)).squeeze(-1)
+    p_verifier = (p_verifier*accept).sum(-1) / num_accept
+    
+    energy = p_verifier - p_theta
+    energy = energy - energy.max()
+    weights = torch.softmax(energy, dim=-1)
+    # selected_index = torch.multinomial(weights, num_samples=1).squeeze(-1)
+    selected_index = torch.argmax(weights)
+    
+    return selected_index.item()
 
 @dataclass
 class DreamModelOutput(ModelOutput):
@@ -649,9 +665,11 @@ class DreamGenerationMixin:
             generation_logits_hook_func(curr_idx, x, None)
             mask_logits = logits[mask_index]
             
-            gumbel_noise, x0 = sample_with_gumbel(mask_logits, temperature=temperature, top_p=top_p, top_k=top_k)
+            mask_logits = mask_logits.unsqueeze(0).repeat(N_PARALELS_SAMPLES, 1, 1)
+            gumbel_noise, x0 = sample_with_gumbel(mask_logits, temperature=temperature, top_p=top_p, top_k=top_k)  #(K, seqlen, V), (K, seqlen)
             
-            diffusion_logits = mask_logits[:, :151936].unsqueeze(0) #Restrict to vocab of qwen
+            # diffusion_logits = mask_logits[:, :, :151936].unsqueeze(0) #Restrict to vocab of qwen
+            diffusion_logits = mask_logits[:, :, :151936] #Restrict to vocab of qwen
             
             # Verification begins
             verification_time = time.time()
@@ -660,12 +678,14 @@ class DreamGenerationMixin:
                 if is_prefilling:
                     
                     draft = x.clone()[:, :right_idx]
+                    draft = draft.repeat(N_PARALELS_SAMPLES, 1)
                     draft[:, curr_idx:right_idx] = x0
                     cache_position = None
                     attention_mask = None
                     position_ids = None
                 else:
-                    draft = x0.clone().unsqueeze(0)
+                    # draft = x0.clone().unsqueeze(0)
+                    draft = x0.clone()
                     cache_position = all_cache_positions[curr_idx:right_idx]
                     position_ids = cache_position.unsqueeze(0)
                     
@@ -675,7 +695,7 @@ class DreamGenerationMixin:
                                                   cache_position=cache_position,
                                                   position_ids=position_ids) 
                 
-                verifier_past_key_values = verifier_outputs.past_key_values
+                verifier_past_key_values = verifier_outputs.past_key_values # (K, n_heads, seqlen, head_dim)
                 
                 
                 if is_prefilling:
@@ -684,6 +704,7 @@ class DreamGenerationMixin:
                 else:
                     verifier_logits = verifier_outputs.logits
                     verifier_logits = verifier_logits[:, :, :151936]   # truncate special tokens
+                    prev_logits = prev_logits.repeat(N_PARALELS_SAMPLES, 1, 1)
                     verifier_logits = torch.cat([prev_logits, verifier_logits[:, :-1, :]], dim=1)
                 
                 if max_lookahead is not None:    
@@ -693,9 +714,23 @@ class DreamGenerationMixin:
                 accept = apd_accept_criterion(draft, diffusion_logits, verifier_logits, gumbel_noise, apd_mixture_weight)
                 
 
-                num_accept = accept.sum().item()
-                num_accept = min(num_accept, x0.shape[-1])
-
+                # num_accept = accept.sum().item()
+                # num_accept = min(num_accept, x0.shape[-1])
+                num_accept = accept.sum(-1)
+                num_accept = num_accept.clamp(max=x0.shape[-1])
+                accept_mask = (torch.arange(accept.shape[-1], device=accept.device, dtype=accept.dtype) < x0.shape[-1])
+                accept = accept * accept_mask
+                
+                selected_index = energy_resample(x0, accept, num_accept, diffusion_logits, verifier_logits)
+                
+                # keep only the selected sample
+                num_accept = num_accept[selected_index].item()
+                x0 = x0[selected_index, :]
+                diffusion_logits = diffusion_logits[selected_index:selected_index+1, :, :]
+                verifier_logits = verifier_logits[selected_index:selected_index+1, :, :]
+                for i in range(len(verifier_past_key_values)):
+                    verifier_past_key_values.layers[i].keys = verifier_past_key_values.layers[i].keys[selected_index:selected_index+1].repeat(N_PARALELS_SAMPLES, 1, 1, 1)
+                    verifier_past_key_values.layers[i].values = verifier_past_key_values.layers[i].values[selected_index:selected_index+1].repeat(N_PARALELS_SAMPLES, 1, 1, 1)
                 
                 if num_accept < verifier_logits.shape[1]:
                     prev_logits = verifier_logits[:, num_accept, :].unsqueeze(1)

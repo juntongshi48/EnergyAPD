@@ -1,7 +1,9 @@
 **.out
 **.pyc
 
-results/
+results*/
+outputs/
+.vscode/
 
 exp/launch.sh
 exp/batched_eval.sh

@@ -13,6 +13,45 @@ class ProfileEvalHarness(HFLM):
         super().__init__(**args)
         self.profile = {}
         
+    @torch.inference_mode()
+    def manual_generate(self, input_ids, stop, pad_token_id, generation_kwargs):
+        '''
+        x: (b, l)
+        block_length:
+        return: (b, block_size) of normalized probabilities
+        '''
+        max_length = generation_kwargs.get("max_new_tokens", 10000)
+        finished = torch.zeros(input_ids.shape[0], dtype=torch.bool, device=input_ids.device)
+        past_key_values = None
+        for i in range(max_length):
+            if past_key_values is None:
+                outputs = self.model(
+                    input_ids=input_ids,
+                    use_cache=True,
+                    past_key_values=past_key_values
+                )
+            else:
+                outputs = self.model(
+                    input_ids=next_token,
+                    use_cache=True,
+                    past_key_values=past_key_values
+                )
+            past_key_values = outputs.past_key_values
+            next_token_logits = outputs.logits[:,-1:,:] # (b, 1, |V|)
+            next_token = torch.argmax(next_token_logits, dim=-1) # (b, 1)
+            
+            next_token[finished, :] = pad_token_id
+            input_ids = torch.cat([input_ids, next_token], dim=-1)
+            
+            for stop_token in stop:
+                stop_token = torch.tensor(stop_token, device=input_ids.device).unsqueeze(0) #(1, len_stop)
+                new_finished = input_ids[:, -stop_token.shape[1]:].eq(stop_token).all(dim=-1)
+                finished = finished | new_finished
+            
+            if finished.all():
+                break
+        return input_ids
+        
     def _model_generate(self, context, max_length, stop, **generation_kwargs):
         # temperature = 0.0 if not set
         # if do_sample is false and temp==0.0:
@@ -33,6 +72,10 @@ class ProfileEvalHarness(HFLM):
         )
         
         start = time.time()
+        
+        # stop_tokens = self.tokenizer(stop)['input_ids']
+        # output = self.manual_generate(context, stop_tokens, self.tokenizer.pad_token_id, generation_kwargs)
+        
         output = self.model.generate(
             input_ids=context,
             max_length=max_length,
@@ -48,6 +91,8 @@ class ProfileEvalHarness(HFLM):
             "num_tokens_generated": output.shape[1] - context.shape[1],
             "total_time": stop_time - start,
         })
+        
+        
         
         return output
     

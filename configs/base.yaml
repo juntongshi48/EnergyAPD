@@ -1,0 +1,33 @@
+defaults:
+  - _self_
+
+# conf/config.yaml
+model_alias: "dream"   # choices: [qwen7b, qwen0.5b, dream, llada]
+
+task: "gsm8k"          # choices: [gsm8k, math, gpqa, humaneval]
+
+output_dir: "results"
+
+limit: null            # int or null, "Limit the number of samples per task for quick testing (e.g., 10 or 0.1 for 10%%)."
+
+alg: null              # choices: [leftright, low_confidence, random, origin, entropy, apd]
+
+qwen_small_ckpt: "Qwen/Qwen2.5-0.5B"
+qwen_7b_ckpt: "Qwen/Qwen2.5-7B"
+dream_ckpt: "Dream-org/Dream-v0-Instruct-7B"
+llada_ckpt: "GSAI-ML/LLaDA-8B-Instruct"
+
+tokens_per_step: null      # K
+kv_window: null            # W
+max_lookahead: null        # M
+apd_mixture_weight: null   # R
+
+verifier_size: "small"     # choices: [small, large]
+
+temperature: null
+top_p: null
+max_gen_len: 16384
+
+num_steps: null            # APD / Taylor steps
+
+tag: ""                    # name suffix for results

@@ -36,7 +36,6 @@ logger = logging.get_logger(__name__)
 
 import time
 
-N_PARALELS_SAMPLES = 1
 
 
 def top_p_logits(logits, top_p=None):
@@ -191,6 +190,7 @@ class DreamGenerationConfig(GenerationConfig):
         self.kv_window: Optional[int] = kwargs.pop("kv_window", None)
         self.max_lookahead: Optional[int] = kwargs.pop("max_lookahead", None)
         self.apd_mixture_weight: Optional[float] = kwargs.pop("apd_mixture_weight", None)
+        self.n_parallel_samples: Optional[int] = kwargs.pop("n_parallel_samples", None)
         
 
         # Parameters that define the output variables of `generate`
@@ -441,15 +441,26 @@ class DreamGenerationMixin:
         )
 
         if generation_config.alg == "apd" or generation_config.alg == "leftright":
-            result = self.apd_sample(
-                input_ids,
-                attention_mask=attention_mask,
-                generation_config=generation_config,
-                generation_tokens_hook_func=generation_tokens_hook_func,
-                generation_logits_hook_func=generation_logits_hook_func,
-                verifier_model=verifier_model
-                
-            )
+            if generation_config.n_parallel_samples is not None and generation_config.n_parallel_samples > 1:
+                result = self.energy_apd_sample(
+                    input_ids,
+                    attention_mask=attention_mask,
+                    generation_config=generation_config,
+                    generation_tokens_hook_func=generation_tokens_hook_func,
+                    generation_logits_hook_func=generation_logits_hook_func,
+                    verifier_model=verifier_model
+                    
+                )
+            else:
+                result = self.apd_sample(
+                    input_ids,
+                    attention_mask=attention_mask,
+                    generation_config=generation_config,
+                    generation_tokens_hook_func=generation_tokens_hook_func,
+                    generation_logits_hook_func=generation_logits_hook_func,
+                    verifier_model=verifier_model
+                    
+                )
         else:
             result = self._sample(
                 input_ids,
@@ -561,7 +572,224 @@ class DreamGenerationMixin:
         else:
             return x
         
-    def apd_sample(
+    def energy_apd_sample(
+        self,
+        input_ids: torch.LongTensor,
+        attention_mask: Optional[torch.LongTensor],
+        generation_config: DreamGenerationConfig,
+        generation_tokens_hook_func,
+        generation_logits_hook_func,
+        verifier_model
+    ) -> Union[DreamModelOutput, torch.LongTensor]:
+        
+        total_time =  time.time()
+        num_forward_evals = 0
+        num_tokens_generated = 0
+        total_verification_time = 0
+        acceptance_counts = []
+        
+        
+        # init values
+        output_history = generation_config.output_history
+        return_dict_in_generate = generation_config.return_dict_in_generate
+        max_length = generation_config.max_length
+        mask_token_id = generation_config.mask_token_id
+        temperature = generation_config.temperature
+        top_p = generation_config.top_p
+        top_k = generation_config.top_k
+        tokens_per_step = generation_config.tokens_per_step
+        kv_window = generation_config.kv_window
+        max_lookahead = generation_config.max_lookahead
+        apd_mixture_weight = generation_config.apd_mixture_weight
+        n_parallel_samples = generation_config.n_parallel_samples
+
+        # pad input_ids to max_length
+        x = F.pad(input_ids, (0, max_length - input_ids.shape[1]), value=mask_token_id)
+        
+        if attention_mask is not None and torch.any(attention_mask == 0.0):
+            # we do not mask the [MASK] tokens so value = 1.0
+            attention_mask = F.pad(attention_mask, (0, max_length - attention_mask.shape[1]), value=1.0)
+            tok_idx = attention_mask.long().cumsum(-1) - 1
+            tok_idx.masked_fill_(attention_mask == 0, 1)
+            # attention_mask is of shape [B, N]
+            # broadcast to [B, 1, N, N]
+            attention_mask = torch.logical_and(
+                attention_mask.unsqueeze(1).unsqueeze(-2),
+                attention_mask.unsqueeze(1).unsqueeze(-1),
+            )
+        else:
+            tok_idx = None
+            attention_mask = "full"
+
+
+        # this allows user-defined token control of the intermediate steps
+        generation_tokens_hook_func(None, x, None)
+        
+        indices = (x == mask_token_id).nonzero()
+        masked_indices, _ = torch.unique(indices[:, 1], return_inverse=True)
+        curr_idx = masked_indices[0].item()
+        is_prefilling = True
+        verifier_past_key_values = None
+        
+        prev_logits = None
+        all_cache_positions = torch.arange(x.shape[-1]).long().to(self.device)
+        diffusion_past_key_values = None
+        
+        while curr_idx < x.shape[-1]:
+            
+            if max_lookahead is not None:
+                right_idx = min(curr_idx + max_lookahead, x.shape[-1])
+            else:
+                right_idx = x.shape[-1]
+                
+            if kv_window is not None: #and diffusion_past_key_values is not None:
+                if diffusion_past_key_values is None:
+                    left_idx = 0
+                else:
+                    left_idx = max(curr_idx - kv_window - num_accept + 1, 0) # Subtract num_accept to compute KV on newly sampled tokens
+            else:
+                left_idx = 0
+            
+            truncated_x = x[:, left_idx:right_idx]
+            mask_index = (truncated_x == mask_token_id)
+
+            
+            cache_position = all_cache_positions[left_idx:right_idx] if diffusion_past_key_values is not None else None
+            position_ids = cache_position.unsqueeze(0) if cache_position is not None else None
+            
+            if diffusion_past_key_values is not None:
+                diffusion_past_key_values.crop(left_idx)
+            
+            outputs = self(truncated_x, 
+                            attention_mask="full", 
+                            past_key_values=diffusion_past_key_values,
+                            cache_position=cache_position,
+                            position_ids=position_ids)
+            
+            logits = outputs.logits
+            logits = torch.cat([logits[:,:1], logits[:, :-1]], dim=1)
+            
+            diffusion_past_key_values = outputs.past_key_values if kv_window is not None else None
+            
+            num_forward_evals += 1
+
+            # this allows user-defined logits control of the intermediate steps
+            generation_logits_hook_func(curr_idx, x, None)
+            mask_logits = logits[mask_index]
+            
+            mask_logits = mask_logits.unsqueeze(0).repeat(n_parallel_samples, 1, 1)
+            gumbel_noise, x0 = sample_with_gumbel(mask_logits, temperature=temperature, top_p=top_p, top_k=top_k)  #(K, seqlen, V), (K, seqlen)
+            
+            # diffusion_logits = mask_logits[:, :, :151936].unsqueeze(0) #Restrict to vocab of qwen
+            diffusion_logits = mask_logits[:, :, :151936] #Restrict to vocab of qwen
+            
+            # Verification begins
+            verification_time = time.time()
+            
+            if apd_mixture_weight is not None:
+                if is_prefilling:
+                    
+                    draft = x.clone()[:, :right_idx]
+                    draft = draft.repeat(n_parallel_samples, 1)
+                    draft[:, curr_idx:right_idx] = x0
+                    cache_position = None
+                    attention_mask = None
+                    position_ids = None
+                else:
+                    # draft = x0.clone().unsqueeze(0)
+                    draft = x0.clone()
+                    cache_position = all_cache_positions[curr_idx:right_idx]
+                    position_ids = cache_position.unsqueeze(0)
+                    
+                
+                verifier_outputs = verifier_model(draft, 
+                                                  past_key_values=verifier_past_key_values,
+                                                  cache_position=cache_position,
+                                                  position_ids=position_ids) 
+                
+                verifier_past_key_values = verifier_outputs.past_key_values # (K, n_heads, seqlen, head_dim)
+                
+                
+                if is_prefilling:
+                    verifier_logits = verifier_outputs.logits[:, curr_idx-1:-1, :] #shift logits
+                    verifier_logits = verifier_logits[:, :, :151936]   # truncate special tokens
+                else:
+                    verifier_logits = verifier_outputs.logits
+                    verifier_logits = verifier_logits[:, :, :151936]   # truncate special tokens
+                    prev_logits = prev_logits.repeat(n_parallel_samples, 1, 1)
+                    verifier_logits = torch.cat([prev_logits, verifier_logits[:, :-1, :]], dim=1)
+                
+                if max_lookahead is not None:    
+                    verifier_logits = verifier_logits[:, :max_lookahead, :]  
+                is_prefilling = False
+
+                accept = apd_accept_criterion(draft, diffusion_logits, verifier_logits, gumbel_noise, apd_mixture_weight)
+                
+
+                # num_accept = accept.sum().item()
+                # num_accept = min(num_accept, x0.shape[-1])
+                num_accept = accept.sum(-1)
+                num_accept = num_accept.clamp(max=x0.shape[-1])
+                accept_mask = (torch.arange(accept.shape[-1], device=accept.device, dtype=accept.dtype) < x0.shape[-1])
+                accept = accept * accept_mask
+                
+                selected_index = energy_resample(x0, accept, num_accept, diffusion_logits, verifier_logits)
+                
+                # keep only the selected sample
+                num_accept = num_accept[selected_index].item()
+                x0 = x0[selected_index, :]
+                diffusion_logits = diffusion_logits[selected_index:selected_index+1, :, :]
+                verifier_logits = verifier_logits[selected_index:selected_index+1, :, :]
+                for i in range(len(verifier_past_key_values)):
+                    verifier_past_key_values.layers[i].keys = verifier_past_key_values.layers[i].keys[selected_index:selected_index+1].repeat(n_parallel_samples, 1, 1, 1)
+                    verifier_past_key_values.layers[i].values = verifier_past_key_values.layers[i].values[selected_index:selected_index+1].repeat(n_parallel_samples, 1, 1, 1)
+                
+                if num_accept < verifier_logits.shape[1]:
+                    prev_logits = verifier_logits[:, num_accept, :].unsqueeze(1)
+                else:
+                    prev_logits = verifier_logits[:, -1, :].unsqueeze(1)
+                    
+                verifier_past_key_values.crop(curr_idx+num_accept)
+            else:
+                num_accept = tokens_per_step
+            
+            x[0, curr_idx:curr_idx+num_accept] = x0[:num_accept]
+            curr_idx += num_accept
+
+            no_mask = (x == mask_token_id).sum().item() == 0
+            has_eos = (x == generation_config.eos_token_id).sum().item() > 0
+            
+            
+            # this allows user-defined token control of the intermediate steps
+            total_verification_time += time.time() - verification_time
+            num_tokens_generated += num_accept
+            
+            acceptance_counts.append(num_accept)
+            generation_tokens_hook_func(curr_idx, x, acceptance_counts)
+            
+            if no_mask or has_eos:
+                break
+            
+        total_time = time.time() - total_time
+        
+        profile = ProfileOutput(
+            num_forward_evals=num_forward_evals,
+            num_tokens_generated=num_tokens_generated,
+            verification_time=total_verification_time,
+            total_time=total_time,
+            acceptance_counts=acceptance_counts,
+        )
+        
+        if return_dict_in_generate:
+            return DreamModelOutputWithProfile(
+                sequences=x,
+                profile=profile
+            )
+        else:
+            return x
+        
+        
+def apd_sample(
         self,
         input_ids: torch.LongTensor,
         attention_mask: Optional[torch.LongTensor],
@@ -665,11 +893,9 @@ class DreamGenerationMixin:
             generation_logits_hook_func(curr_idx, x, None)
             mask_logits = logits[mask_index]
             
-            mask_logits = mask_logits.unsqueeze(0).repeat(N_PARALELS_SAMPLES, 1, 1)
-            gumbel_noise, x0 = sample_with_gumbel(mask_logits, temperature=temperature, top_p=top_p, top_k=top_k)  #(K, seqlen, V), (K, seqlen)
+            gumbel_noise, x0 = sample_with_gumbel(mask_logits, temperature=temperature, top_p=top_p, top_k=top_k)
             
-            # diffusion_logits = mask_logits[:, :, :151936].unsqueeze(0) #Restrict to vocab of qwen
-            diffusion_logits = mask_logits[:, :, :151936] #Restrict to vocab of qwen
+            diffusion_logits = mask_logits[:, :151936].unsqueeze(0) #Restrict to vocab of qwen
             
             # Verification begins
             verification_time = time.time()
@@ -678,14 +904,12 @@ class DreamGenerationMixin:
                 if is_prefilling:
                     
                     draft = x.clone()[:, :right_idx]
-                    draft = draft.repeat(N_PARALELS_SAMPLES, 1)
                     draft[:, curr_idx:right_idx] = x0
                     cache_position = None
                     attention_mask = None
                     position_ids = None
                 else:
-                    # draft = x0.clone().unsqueeze(0)
-                    draft = x0.clone()
+                    draft = x0.clone().unsqueeze(0)
                     cache_position = all_cache_positions[curr_idx:right_idx]
                     position_ids = cache_position.unsqueeze(0)
                     
@@ -695,16 +919,13 @@ class DreamGenerationMixin:
                                                   cache_position=cache_position,
                                                   position_ids=position_ids) 
                 
-                verifier_past_key_values = verifier_outputs.past_key_values # (K, n_heads, seqlen, head_dim)
+                verifier_past_key_values = verifier_outputs.past_key_values
                 
-                
+                 
                 if is_prefilling:
                     verifier_logits = verifier_outputs.logits[:, curr_idx-1:-1, :] #shift logits
-                    verifier_logits = verifier_logits[:, :, :151936]   # truncate special tokens
                 else:
                     verifier_logits = verifier_outputs.logits
-                    verifier_logits = verifier_logits[:, :, :151936]   # truncate special tokens
-                    prev_logits = prev_logits.repeat(N_PARALELS_SAMPLES, 1, 1)
                     verifier_logits = torch.cat([prev_logits, verifier_logits[:, :-1, :]], dim=1)
                 
                 if max_lookahead is not None:    
@@ -714,23 +935,9 @@ class DreamGenerationMixin:
                 accept = apd_accept_criterion(draft, diffusion_logits, verifier_logits, gumbel_noise, apd_mixture_weight)
                 
 
-                # num_accept = accept.sum().item()
-                # num_accept = min(num_accept, x0.shape[-1])
-                num_accept = accept.sum(-1)
-                num_accept = num_accept.clamp(max=x0.shape[-1])
-                accept_mask = (torch.arange(accept.shape[-1], device=accept.device, dtype=accept.dtype) < x0.shape[-1])
-                accept = accept * accept_mask
-                
-                selected_index = energy_resample(x0, accept, num_accept, diffusion_logits, verifier_logits)
-                
-                # keep only the selected sample
-                num_accept = num_accept[selected_index].item()
-                x0 = x0[selected_index, :]
-                diffusion_logits = diffusion_logits[selected_index:selected_index+1, :, :]
-                verifier_logits = verifier_logits[selected_index:selected_index+1, :, :]
-                for i in range(len(verifier_past_key_values)):
-                    verifier_past_key_values.layers[i].keys = verifier_past_key_values.layers[i].keys[selected_index:selected_index+1].repeat(N_PARALELS_SAMPLES, 1, 1, 1)
-                    verifier_past_key_values.layers[i].values = verifier_past_key_values.layers[i].values[selected_index:selected_index+1].repeat(N_PARALELS_SAMPLES, 1, 1, 1)
+                num_accept = accept.sum().item()
+                num_accept = min(num_accept, x0.shape[-1])
+
                 
                 if num_accept < verifier_logits.shape[1]:
                     prev_logits = verifier_logits[:, num_accept, :].unsqueeze(1)
@@ -775,5 +982,3 @@ class DreamGenerationMixin:
             )
         else:
             return x
-        
-        

@@ -22,6 +22,8 @@ kv_window: null            # W
 max_lookahead: null        # M
 apd_mixture_weight: null   # R
 
+n_parallel_samples: null
+
 verifier_size: "small"     # choices: [small, large]
 
 temperature: null

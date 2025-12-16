@@ -241,6 +241,7 @@ class DreamEvalHarness(HFLM):
         self.max_lookahead = args.get("max_lookahead", None)
         self.kv_window = args.get("kv_window", None)
         self.apd_mixture_weight = args.get("apd_mixture_weight", None)
+        self.n_parallen_samples = args.get("n_parallel_samples", 1)
         self.num_steps = args.get("num_steps", None)
         
         if self.num_steps is None:
@@ -376,6 +377,7 @@ class DreamEvalHarness(HFLM):
                 max_lookahead=self.max_lookahead,
                 kv_window=self.kv_window,
                 apd_mixture_weight=self.apd_mixture_weight,
+                n_parallel_samples=self.n_parallen_samples,
                 verifier_model=self.verifier_model,
                 return_dict_in_generate=True
                 )
@@ -399,6 +401,7 @@ class DreamEvalHarness(HFLM):
                 max_lookahead=self.max_lookahead,
                 kv_window=self.kv_window,
                 apd_mixture_weight=self.apd_mixture_weight,
+                n_parallel_samples=self.n_parallen_samples,
                 return_dict_in_generate=True
                 )
             

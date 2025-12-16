@@ -35,6 +35,9 @@ def get_model(args):
     max_lookahead = args.max_lookahead
     kv_window = args.kv_window
     apd_mixture_weight = args.apd_mixture_weight
+    # %%% New Dev Configs %%%
+    n_parallel_samples = args.n_parallel_samples
+    # %%% New Dev Configs %%%
     num_steps = args.num_steps
     task_name = args.task
 
@@ -71,6 +74,7 @@ def get_model(args):
             max_lookahead=max_lookahead,
             kv_window=kv_window,
             apd_mixture_weight=apd_mixture_weight,
+            n_parallel_samples=n_parallel_samples,
             num_steps=num_steps,
             max_gen_toks=512 if task_name=="math" else 256,
             verifier_ckpt=verifier_ckpt,
@@ -120,6 +124,8 @@ def main(args):
         task_str += f"_W={args.kv_window}"
     if args.apd_mixture_weight is not None:
         task_str += f"_R={args.apd_mixture_weight}"
+    if args.n_parallel_samples is not None:
+        task_str += f"_N={args.n_parallel_samples}"
     if args.num_steps is not None:
         task_str += f"_num_steps={args.num_steps}"
     if args.verifier_size is not None and args.alg=='apd':

@@ -4,6 +4,7 @@
 results*/
 outputs/
 .vscode/
+time_profile*
 
 exp/launch.sh
 exp/batched_eval.sh

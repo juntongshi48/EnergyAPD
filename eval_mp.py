@@ -37,6 +37,7 @@ def get_model(args):
     apd_mixture_weight = args.apd_mixture_weight
     # %%% New Dev Configs %%%
     n_parallel_samples = args.n_parallel_samples
+    max_unmask = args.max_unmask
     # %%% New Dev Configs %%%
     num_steps = args.num_steps
     task_name = args.task
@@ -75,6 +76,7 @@ def get_model(args):
             kv_window=kv_window,
             apd_mixture_weight=apd_mixture_weight,
             n_parallel_samples=n_parallel_samples,
+            max_unmask=max_unmask,
             num_steps=num_steps,
             max_gen_toks=512 if task_name=="math" else 256,
             verifier_ckpt=verifier_ckpt,
@@ -109,8 +111,16 @@ def main(args):
                            f"Valid algorithms for {args.model_alias}: {valid_alg_str}")
     
     model = get_model(args)
-    output_dir = os.path.join(f"{args.output_dir}_{args.task}")
+    output_dir = os.path.join(f"{args.output_dir}_{args.task}_{args.verifier_size}")
     os.makedirs(output_dir, exist_ok=True)
+    
+    # max_length is defined only for generating with AR models
+    # it specifies the max length of (input + generated) tokens
+    max_length = 16384
+    if args.model_alias == "qwen7b" and 'Math' in args.qwen_7b_ckpt:
+        max_length = 4096
+    elif args.model_alias == "qwen0.5b" and 'Math' in args.qwen_small_ckpt:
+        max_length = 4096
     
     task_str = ""
     if args.alg is not None:
@@ -126,6 +136,10 @@ def main(args):
         task_str += f"_R={args.apd_mixture_weight}"
     if args.n_parallel_samples is not None:
         task_str += f"_N={args.n_parallel_samples}"
+    if args.max_unmask is not None:
+        if args.max_lookahead is not None:
+            assert args.max_unmask <= args.max_lookahead, "max_unmask should be less than or equal to max_lookahead"
+        task_str += f"_U={args.max_unmask}"
     if args.num_steps is not None:
         task_str += f"_num_steps={args.num_steps}"
     if args.verifier_size is not None and args.alg=='apd':
@@ -134,8 +148,9 @@ def main(args):
         task_str += f"_temp{args.temperature}"
     if args.top_p is not None:
         task_str += f"_topp{args.top_p}"
-    if args.max_gen_len != 16384:
-        task_str += f"_genlen{args.max_gen_len}"
+    if 'qwen' in args.model_alias and args.max_length is not None:
+        task_str += f"_genlen{args.max_length}"
+        max_length = args.max_length
     if args.tag:
         task_str += f"_{args.tag}"
     output_filename = f"{args.model_alias}_{task_str}_limit{args.limit}.json"
@@ -168,7 +183,8 @@ def main(args):
             gen_kwargs += f"top_p={args.top_p},"
             do_sample = True
         gen_kwargs += f"do_sample={do_sample},"
-        gen_kwargs += f"max_new_tokens={args.max_gen_len},"
+        gen_kwargs += f"max_length={max_length},"
+        print(f"max_length is set to {max_length} for generation.")
     
     results = evaluator.simple_evaluate(
         model=model,
@@ -185,12 +201,34 @@ def main(args):
     )
 
     results["profile"] = model.get_profile()
+    if "num_accepted" in results["profile"]:
+        num_accepted = results["profile"]["num_accepted"]
+        results["profile"].pop("num_accepted")
+        save_path = output_path.replace(".json", "_accept_hist.png")
+        plot_accept_counts(num_accepted, save_path)
     
     parsed_results = parse_results(results, task_name=task_name)
     
     with open(output_path, 'w') as f:
         json.dump(parsed_results, f, indent=4)
     
+def plot_accept_counts(num_accepted, save_path):
+    from collections import Counter
+    import matplotlib.pyplot as plt
+
+    counts = Counter(num_accepted)
+    total = len(num_accepted)
+
+    xs = sorted(counts)
+    ys = [counts[x] / total * 100 for x in xs]
+
+    plt.figure()
+    plt.bar(xs, ys)
+    plt.xlabel("Num Accepted")
+    plt.ylabel("Percentage (%)")
+    plt.title("Histogram of Num Accepted (%)")
+    plt.savefig(save_path)
+    plt.close()
 
 if __name__ == "__main__":
     main()

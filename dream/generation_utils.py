@@ -35,8 +35,33 @@ logger = logging.get_logger(__name__)
 
 
 import time
+import os
+
+PRINT_PROFILE=False
 
 
+class GPUTimer:
+    def __init__(self, log_file_path=None):
+        self.start_event = None
+        self.end_event = None
+        self.log_file_path = log_file_path
+
+    def start(self):
+        self.start_event = torch.cuda.Event(enable_timing=True)
+        self.end_event = torch.cuda.Event(enable_timing=True)
+        self.start_event.record()
+
+    def end(self, event_name):
+        self.end_event.record()
+        torch.cuda.synchronize()
+        elapsed_time = self.start_event.elapsed_time(self.end_event)
+        if PRINT_PROFILE:
+            msg = f"{event_name}: {elapsed_time:.3f} ms"
+            print(msg)
+            with open(self.log_file_path, "a") as f:
+                f.write(msg + "\n")
+        
+        return elapsed_time
 
 def top_p_logits(logits, top_p=None):
     sorted_logits, sorted_indices = torch.sort(logits, descending=True)
@@ -163,6 +188,7 @@ class ProfileOutput(ModelOutput):
     num_tokens_generated: int = None
     verification_time: float = None
     total_time: float = None
+    detailed_time: Dict[str, float] = None
     acceptance_counts: List[int] = None
     
     
@@ -191,6 +217,7 @@ class DreamGenerationConfig(GenerationConfig):
         self.max_lookahead: Optional[int] = kwargs.pop("max_lookahead", None)
         self.apd_mixture_weight: Optional[float] = kwargs.pop("apd_mixture_weight", None)
         self.n_parallel_samples: Optional[int] = kwargs.pop("n_parallel_samples", None)
+        self.max_unmask: Optional[int] = kwargs.pop("max_unmask", None)
         
 
         # Parameters that define the output variables of `generate`
@@ -452,7 +479,7 @@ class DreamGenerationMixin:
                     
                 )
             else:
-                result = self.apd_sample(
+                result = self.energy_apd_sample(
                     input_ids,
                     attention_mask=attention_mask,
                     generation_config=generation_config,
@@ -602,6 +629,7 @@ class DreamGenerationMixin:
         max_lookahead = generation_config.max_lookahead
         apd_mixture_weight = generation_config.apd_mixture_weight
         n_parallel_samples = generation_config.n_parallel_samples
+        max_unmask = generation_config.max_unmask
 
         # pad input_ids to max_length
         x = F.pad(input_ids, (0, max_length - input_ids.shape[1]), value=mask_token_id)
@@ -635,7 +663,30 @@ class DreamGenerationMixin:
         all_cache_positions = torch.arange(x.shape[-1]).long().to(self.device)
         diffusion_past_key_values = None
         
+        profile_parent_dir = "time_profiles"
+        if not os.path.exists(profile_parent_dir):
+            os.makedirs(profile_parent_dir)
+        profile_fn = f"N={n_parallel_samples}_U={max_unmask}_M={max_lookahead}_k={kv_window}.txt"
+        profile_path = os.path.join(profile_parent_dir, profile_fn)
+        my_timer = GPUTimer(log_file_path=profile_path)
+        detailed_time = {
+            "DLM forward": 0.0,
+            "sampling": 0.0,
+            "AR forward": 0.0,
+            "apd accept": 0.0,
+            "energy resample": 0.0
+        }
+        
+        # num_acc_fn = f"NumAccCounts_N={n_parallel_samples}_U={max_unmask}_M={max_lookahead}_K={kv_window}.txt"
+        # num_acc_path = os.path.join(profile_parent_dir, num_acc_fn)
+        
         while curr_idx < x.shape[-1]:
+            
+            if PRINT_PROFILE:
+                opening_msg = f"\n#### step={num_forward_evals }, curr_idx={curr_idx} ####"
+                print(opening_msg)
+                with open(profile_path, "a") as f:
+                    f.write(opening_msg + "\n")
             
             if max_lookahead is not None:
                 right_idx = min(curr_idx + max_lookahead, x.shape[-1])
@@ -660,11 +711,13 @@ class DreamGenerationMixin:
             if diffusion_past_key_values is not None:
                 diffusion_past_key_values.crop(left_idx)
             
+            my_timer.start()
             outputs = self(truncated_x, 
                             attention_mask="full", 
                             past_key_values=diffusion_past_key_values,
                             cache_position=cache_position,
                             position_ids=position_ids)
+            detailed_time['DLM forward'] += my_timer.end(f"{num_forward_evals } DLM forward") * 1e-3
             
             logits = outputs.logits
             logits = torch.cat([logits[:,:1], logits[:, :-1]], dim=1)
@@ -677,8 +730,14 @@ class DreamGenerationMixin:
             generation_logits_hook_func(curr_idx, x, None)
             mask_logits = logits[mask_index]
             
+            if max_unmask is not None:
+                mask_logits = mask_logits[:max_unmask, :]
+                right_idx = min(curr_idx + max_unmask, x.shape[-1])
             mask_logits = mask_logits.unsqueeze(0).repeat(n_parallel_samples, 1, 1)
+            
+            my_timer.start()
             gumbel_noise, x0 = sample_with_gumbel(mask_logits, temperature=temperature, top_p=top_p, top_k=top_k)  #(K, seqlen, V), (K, seqlen)
+            detailed_time["sampling"] += my_timer.end(f"{num_forward_evals } sampling") * 1e-3
             
             # diffusion_logits = mask_logits[:, :, :151936].unsqueeze(0) #Restrict to vocab of qwen
             diffusion_logits = mask_logits[:, :, :151936] #Restrict to vocab of qwen
@@ -701,12 +760,12 @@ class DreamGenerationMixin:
                     cache_position = all_cache_positions[curr_idx:right_idx]
                     position_ids = cache_position.unsqueeze(0)
                     
-                
+                my_timer.start()
                 verifier_outputs = verifier_model(draft, 
                                                   past_key_values=verifier_past_key_values,
                                                   cache_position=cache_position,
                                                   position_ids=position_ids) 
-                
+                detailed_time["AR forward"] += my_timer.end(f"{num_forward_evals } AR forward") * 1e-3
                 verifier_past_key_values = verifier_outputs.past_key_values # (K, n_heads, seqlen, head_dim)
                 
                 
@@ -720,11 +779,14 @@ class DreamGenerationMixin:
                     verifier_logits = torch.cat([prev_logits, verifier_logits[:, :-1, :]], dim=1)
                 
                 if max_lookahead is not None:    
-                    verifier_logits = verifier_logits[:, :max_lookahead, :]  
+                    verifier_logits = verifier_logits[:, :max_lookahead, :]
+                if max_unmask is not None:
+                    verifier_logits = verifier_logits[:, :max_unmask, :]
                 is_prefilling = False
 
+                my_timer.start()
                 accept = apd_accept_criterion(draft, diffusion_logits, verifier_logits, gumbel_noise, apd_mixture_weight)
-                
+                detailed_time["apd accept"] += my_timer.end(f"{num_forward_evals } apd accept") * 1e-3
 
                 # num_accept = accept.sum().item()
                 # num_accept = min(num_accept, x0.shape[-1])
@@ -733,8 +795,11 @@ class DreamGenerationMixin:
                 accept_mask = (torch.arange(accept.shape[-1], device=accept.device, dtype=accept.dtype) < x0.shape[-1])
                 accept = accept * accept_mask
                 
+                my_timer.start()
                 selected_index = energy_resample(x0, accept, num_accept, diffusion_logits, verifier_logits)
+                detailed_time["energy resample"] += my_timer.end(f"{num_forward_evals } energy resample") * 1e-3
                 
+                my_timer.start()
                 # keep only the selected sample
                 num_accept = num_accept[selected_index].item()
                 x0 = x0[selected_index, :]
@@ -743,6 +808,7 @@ class DreamGenerationMixin:
                 for i in range(len(verifier_past_key_values)):
                     verifier_past_key_values.layers[i].keys = verifier_past_key_values.layers[i].keys[selected_index:selected_index+1].repeat(n_parallel_samples, 1, 1, 1)
                     verifier_past_key_values.layers[i].values = verifier_past_key_values.layers[i].values[selected_index:selected_index+1].repeat(n_parallel_samples, 1, 1, 1)
+                my_timer.end(f"{num_forward_evals } clean up")
                 
                 if num_accept < verifier_logits.shape[1]:
                     prev_logits = verifier_logits[:, num_accept, :].unsqueeze(1)
@@ -769,14 +835,31 @@ class DreamGenerationMixin:
             
             if no_mask or has_eos:
                 break
+             
+            # with open(num_acc_path, "a") as f:
+            #     f.write(f"{num_accept}\n")
+        
+        if PRINT_PROFILE:
+            for i, (k, v) in enumerate(detailed_time.items()):
+                profile_msg = f"Total time for {k}: {v:.3f} seconds"
+                if i==0:
+                    profile_msg = "\n" + profile_msg
+                print(profile_msg)
+                with open(profile_path, "a") as f:
+                    f.write(profile_msg + "\n")
+        # import pdb; pdb.set_trace()
             
         total_time = time.time() - total_time
+        # Noramlize detailed time by the number of steps
+        for k, v in detailed_time.items():
+            detailed_time[k] = v/num_forward_evals 
         
         profile = ProfileOutput(
             num_forward_evals=num_forward_evals,
             num_tokens_generated=num_tokens_generated,
             verification_time=total_verification_time,
             total_time=total_time,
+            detailed_time=detailed_time,
             acceptance_counts=acceptance_counts,
         )
         
@@ -789,7 +872,7 @@ class DreamGenerationMixin:
             return x
         
         
-def apd_sample(
+    def apd_sample(
         self,
         input_ids: torch.LongTensor,
         attention_mask: Optional[torch.LongTensor],
@@ -924,8 +1007,10 @@ def apd_sample(
                  
                 if is_prefilling:
                     verifier_logits = verifier_outputs.logits[:, curr_idx-1:-1, :] #shift logits
+                    verifier_logits = verifier_logits[:, :, :151936]   # truncate special tokens
                 else:
                     verifier_logits = verifier_outputs.logits
+                    verifier_logits = verifier_logits[:, :, :151936]   # truncate special tokens
                     verifier_logits = torch.cat([prev_logits, verifier_logits[:, :-1, :]], dim=1)
                 
                 if max_lookahead is not None:    

@@ -241,7 +241,8 @@ class DreamEvalHarness(HFLM):
         self.max_lookahead = args.get("max_lookahead", None)
         self.kv_window = args.get("kv_window", None)
         self.apd_mixture_weight = args.get("apd_mixture_weight", None)
-        self.n_parallen_samples = args.get("n_parallel_samples", 1)
+        self.n_parallen_samples = args.get("n_parallel_samples", None)
+        self.max_unmask = args.get("max_unmask", None)
         self.num_steps = args.get("num_steps", None)
         
         if self.num_steps is None:
@@ -273,8 +274,16 @@ class DreamEvalHarness(HFLM):
         
         for k, v in profile.items():
             if k not in self.profile:
-                self.profile[k] = []
-            if type(v) == list:
+                if type(v) == dict:
+                    self.profile[k] = {}
+                    for sub_k, sub_v in v.items():
+                        self.profile[k][sub_k] = []
+                else:
+                    self.profile[k] = []
+            if type(v) == dict:
+                for sub_k, sub_v in v.items():
+                    self.profile[k][sub_k].append(sub_v)
+            elif type(v) == list:
                 self.profile[k].extend(v)
             else:
                 self.profile[k].append(v)
@@ -340,7 +349,18 @@ class DreamEvalHarness(HFLM):
                     "verification_time_stderr": verification_time_stderr,
                     "num_accepted_mean": num_accepted_mean,
                     "num_accepted_stderr": num_accepted_stderr,
-                    "num_accepted_max": num_accepted_max}
+                    "num_accepted_max": num_accepted_max,
+                    "num_accepted": num_accepted.tolist()}
+        
+        if "detailed_time" in self.profile:
+            detailed_time = self.profile["detailed_time"]
+            result["detailed_time"] = {}
+            for k, v in detailed_time.items():
+                times = np.array(v)
+                time_mean = np.mean(times)
+                time_stderr = np.std(times, ddof=1) / math.sqrt(len(times))
+                result["detailed_time"][f"{k}_mean"] = time_mean
+                # result["detailed_time"][f"{k}_stderr"] = time_stderr
         
         return result
     
@@ -378,6 +398,7 @@ class DreamEvalHarness(HFLM):
                 kv_window=self.kv_window,
                 apd_mixture_weight=self.apd_mixture_weight,
                 n_parallel_samples=self.n_parallen_samples,
+                max_unmask=self.max_unmask,
                 verifier_model=self.verifier_model,
                 return_dict_in_generate=True
                 )
@@ -402,6 +423,7 @@ class DreamEvalHarness(HFLM):
                 kv_window=self.kv_window,
                 apd_mixture_weight=self.apd_mixture_weight,
                 n_parallel_samples=self.n_parallen_samples,
+                max_unmask=self.max_unmask,
                 return_dict_in_generate=True
                 )
             

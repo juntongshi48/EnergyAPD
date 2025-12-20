@@ -11,6 +11,8 @@
 #SBATCH --output=sout/eval_gsm8k\_%j.out  # Output file (%j expands to jobID)
 # )
 
+echo "SLURM started successfully"
+
 source /atlas2/u/minkai/miniconda3/etc/profile.d/conda.sh
 conda activate apd
 
@@ -19,17 +21,17 @@ echo "Hostname: $(hostname)"
 mode=$1
 
 model_alias=dream
-task=gsm8k
+task=$2
 alg=apd
 apd_mixture_weight=0.5
-kv_window=null
-max_lookahead=null
-verifier_size="small"
+kv_window=$3
+max_lookahead=$4
+verifier_size=$5
 qwen_small_ckpt="Qwen/Qwen2.5-Math-1.5B-Instruct"
 qwen_7b_ckpt="Qwen/Qwen2.5-Math-7B-Instruct"
 
-n_parallel_samples=5
-max_unmask=32
+n_parallel_samples=$6
+max_unmask=$7
 
 output_dir="results"
 tag="math-instruct_greedy"
@@ -48,7 +50,7 @@ else
     CMD_PREFIX="python"
 fi
 
-gpu_id=3
+gpu_id=0
 CUDA_VISIBLE_DEVICES=${gpu_id} \
 ${CMD_PREFIX} \
     eval_mp.py \

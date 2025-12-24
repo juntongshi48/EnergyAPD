@@ -2,7 +2,7 @@
 #SBATCH --account=atlas
 #SBATCH --partition=atlas
 #SBATCH --qos=normal
-#SBATCH --time=1-00:00:00            # Max time (days-hrs:mins:secs)
+#SBATCH --time=2-00:00:00            # Max time (days-hrs:mins:secs)
 #SBATCH --nodes=1                    # Single node
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=24G

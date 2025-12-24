@@ -13,6 +13,9 @@ from dream.modeling_dream import DreamModel
 import torch.multiprocessing as mp
 import hydra
 
+from collections import Counter
+import matplotlib.pyplot as plt
+
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -37,6 +40,7 @@ def get_model(args):
     apd_mixture_weight = args.apd_mixture_weight
     # %%% New Dev Configs %%%
     n_parallel_samples = args.n_parallel_samples
+    n_parallel_lanes = args.n_parallel_lanes
     max_unmask = args.max_unmask
     # %%% New Dev Configs %%%
     num_steps = args.num_steps
@@ -76,6 +80,7 @@ def get_model(args):
             kv_window=kv_window,
             apd_mixture_weight=apd_mixture_weight,
             n_parallel_samples=n_parallel_samples,
+            n_parallel_lanes=n_parallel_lanes,
             max_unmask=max_unmask,
             num_steps=num_steps,
             max_gen_toks=512 if task_name=="math" else 256,
@@ -111,7 +116,25 @@ def main(args):
                            f"Valid algorithms for {args.model_alias}: {valid_alg_str}")
     
     model = get_model(args)
-    output_dir = os.path.join(f"{args.output_dir}_{args.task}_{args.verifier_size}")
+    
+    ar_model_size = ""
+    if args.model_alias == "dream":
+        ar_model_size = args.verifier_size
+    elif args.model_alias in ["llada", "qwen7b"]:
+        ar_model_size = "large"
+    elif args.model_alias == "qwen0.5b":
+        ar_model_size = "small"
+    
+    ar_model_tag = None
+    if args.model_alias != "llada":
+        if ar_model_size == "large":
+            ar_model_tag = args.qwen_7b_ckpt.split("/Qwen")[1]
+            ar_model_tag = "-".join(ar_model_tag.split("-")[1:])
+        elif ar_model_size == "small":
+            ar_model_tag = args.qwen_small_ckpt.split("/Qwen")[1]
+            ar_model_tag = "-".join(ar_model_tag.split("-")[1:])
+        
+    output_dir = os.path.join(f"{args.output_dir}_{args.task}_{ar_model_size}")
     os.makedirs(output_dir, exist_ok=True)
     
     # max_length is defined only for generating with AR models
@@ -136,6 +159,8 @@ def main(args):
         task_str += f"_R={args.apd_mixture_weight}"
     if args.n_parallel_samples is not None:
         task_str += f"_N={args.n_parallel_samples}"
+    if args.n_parallel_lanes is not None:
+        task_str += f"_L={args.n_parallel_lanes}"
     if args.max_unmask is not None:
         if args.max_lookahead is not None:
             assert args.max_unmask <= args.max_lookahead, "max_unmask should be less than or equal to max_lookahead"
@@ -151,9 +176,11 @@ def main(args):
     if 'qwen' in args.model_alias and args.max_length is not None:
         task_str += f"_genlen{args.max_length}"
         max_length = args.max_length
+    if ar_model_tag is not None:
+        task_str += f"_{ar_model_tag}"
     if args.tag:
         task_str += f"_{args.tag}"
-    output_filename = f"{args.model_alias}_{task_str}_limit{args.limit}.json"
+    output_filename = f"{args.model_alias}{task_str}_limit{args.limit}.json"
     output_path = os.path.join(output_dir, output_filename)
     logger.info(f"Results will be saved to: {output_path}")
     
@@ -206,6 +233,12 @@ def main(args):
         results["profile"].pop("num_accepted")
         save_path = output_path.replace(".json", "_accept_hist.png")
         plot_accept_counts(num_accepted, save_path)
+    if "chosen_lane_id" in results["profile"] and results["profile"]["chosen_lane_id"] is not None:
+        chosen_lane_id = results["profile"]["chosen_lane_id"]
+        hashed_chosen_lane_id = ["".join(map(str, cli)) for cli in chosen_lane_id]
+        results["profile"].pop("chosen_lane_id")
+        save_path = output_path.replace(".json", "_lane_id_hist.png")
+        plot_chosen_lane_id(hashed_chosen_lane_id, save_path)
     
     parsed_results = parse_results(results, task_name=task_name)
     
@@ -213,9 +246,6 @@ def main(args):
         json.dump(parsed_results, f, indent=4)
     
 def plot_accept_counts(num_accepted, save_path):
-    from collections import Counter
-    import matplotlib.pyplot as plt
-
     counts = Counter(num_accepted)
     total = len(num_accepted)
 
@@ -227,6 +257,21 @@ def plot_accept_counts(num_accepted, save_path):
     plt.xlabel("Num Accepted")
     plt.ylabel("Percentage (%)")
     plt.title("Histogram of Num Accepted (%)")
+    plt.savefig(save_path)
+    plt.close()
+    
+def plot_chosen_lane_id(hashed_chosen_lane_id, save_path):
+    counts = Counter(hashed_chosen_lane_id)
+    total = len(hashed_chosen_lane_id)
+
+    xs = sorted(counts)
+    ys = [counts[x] / total * 100 for x in xs]
+
+    plt.figure()
+    plt.bar(xs, ys)
+    plt.xlabel("Chose Lane ID")
+    plt.ylabel("Percentage (%)")
+    plt.title("Histogram of Chosen Lane ID (%)")
     plt.savefig(save_path)
     plt.close()
 

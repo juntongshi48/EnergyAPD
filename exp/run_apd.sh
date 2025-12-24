@@ -2,7 +2,7 @@
 #SBATCH --account=atlas
 #SBATCH --partition=atlas
 #SBATCH --qos=normal
-#SBATCH --time=1-00:00:00            # Max time (days-hrs:mins:secs)
+#SBATCH --time=2-00:00:00            # Max time (days-hrs:mins:secs)
 #SBATCH --nodes=1                    # Single node
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=24G
@@ -28,27 +28,30 @@ verifier_size="small"
 qwen_small_ckpt="Qwen/Qwen2.5-Math-1.5B-Instruct"
 qwen_7b_ckpt="Qwen/Qwen2.5-Math-7B-Instruct"
 
-n_parallel_samples=5
+n_parallel_samples=2
+n_parallel_lanes=3
 max_unmask=32
 
 output_dir="results"
-tag="math-instruct_greedy"
+tag="greedy"
 
 CMD_PREFIX=""
 limit=null
+gpu_id=0
 if [ "$mode" = "debug" ]; then
-    CMD_PREFIX="python -m debugpy --listen 0.0.0.0:5678 --wait-for-client"
-    output_dir="results_debug"
-    limit=2
     echo "In DEBUG mode"
+    CMD_PREFIX="python -m debugpy --listen 0.0.0.0:5678 --wait-for-client"
+    output_dir="debug/results"
+    limit=2
 elif [ "$mode" = "launch" ]; then
-    CMD_PREFIX="srun python"
     echo "In LAUNCH mode"
+    CMD_PREFIX="srun python"
+    gpu_id=0
+    limit=null
 else
     CMD_PREFIX="python"
 fi
 
-gpu_id=3
 CUDA_VISIBLE_DEVICES=${gpu_id} \
 ${CMD_PREFIX} \
     eval_mp.py \
@@ -61,6 +64,7 @@ ${CMD_PREFIX} \
     max_lookahead=${max_lookahead} \
     apd_mixture_weight=${apd_mixture_weight} \
     n_parallel_samples=${n_parallel_samples} \
+    n_parallel_lanes=${n_parallel_lanes} \
     max_unmask=${max_unmask} \
     verifier_size=${verifier_size} \
     tag=${tag} \

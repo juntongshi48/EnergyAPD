@@ -241,7 +241,8 @@ class DreamEvalHarness(HFLM):
         self.max_lookahead = args.get("max_lookahead", None)
         self.kv_window = args.get("kv_window", None)
         self.apd_mixture_weight = args.get("apd_mixture_weight", None)
-        self.n_parallen_samples = args.get("n_parallel_samples", None)
+        self.n_parallel_samples = args.get("n_parallel_samples", None)
+        self.n_parallel_lanes = args.get("n_parallel_lanes", None)
         self.max_unmask = args.get("max_unmask", None)
         self.num_steps = args.get("num_steps", None)
         
@@ -319,6 +320,7 @@ class DreamEvalHarness(HFLM):
         verification_time = np.array(self.profile["verification_time"])
         total_times = np.array(self.profile["total_time"])
         num_accepted = np.array(self.profile["acceptance_counts"])
+        chosen_lane_id = self.profile.get("chosen_lane_id", None)
         
         
         num_foward_evals_mean = np.mean(num_forward_evals)
@@ -350,7 +352,8 @@ class DreamEvalHarness(HFLM):
                     "num_accepted_mean": num_accepted_mean,
                     "num_accepted_stderr": num_accepted_stderr,
                     "num_accepted_max": num_accepted_max,
-                    "num_accepted": num_accepted.tolist()}
+                    "num_accepted": num_accepted.tolist(),
+                    "chosen_lane_id": chosen_lane_id}
         
         if "detailed_time" in self.profile:
             detailed_time = self.profile["detailed_time"]
@@ -397,7 +400,8 @@ class DreamEvalHarness(HFLM):
                 max_lookahead=self.max_lookahead,
                 kv_window=self.kv_window,
                 apd_mixture_weight=self.apd_mixture_weight,
-                n_parallel_samples=self.n_parallen_samples,
+                n_parallel_samples=self.n_parallel_samples,
+                n_parallel_lanes=self.n_parallel_lanes,
                 max_unmask=self.max_unmask,
                 verifier_model=self.verifier_model,
                 return_dict_in_generate=True
@@ -423,6 +427,7 @@ class DreamEvalHarness(HFLM):
                 kv_window=self.kv_window,
                 apd_mixture_weight=self.apd_mixture_weight,
                 n_parallel_samples=self.n_parallen_samples,
+                n_parallel_lanes=self.n_parallel_lanes,
                 max_unmask=self.max_unmask,
                 return_dict_in_generate=True
                 )

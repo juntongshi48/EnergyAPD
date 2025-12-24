@@ -2,7 +2,7 @@
 #SBATCH --account=atlas
 #SBATCH --partition=atlas
 #SBATCH --qos=normal
-#SBATCH --time=1-00:00:00            # Max time (days-hrs:mins:secs)
+#SBATCH --time=2-00:00:00            # Max time (days-hrs:mins:secs)
 #SBATCH --nodes=1                    # Single node
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=24G
@@ -18,30 +18,32 @@ echo "Hostname: $(hostname)"
 
 mode=$1
 
-model_alias=qwen0.5b
-task=math
+model_alias=qwen7b
+task=gsm8k
 alg=leftright
 qwen_small_ckpt="Qwen/Qwen2.5-Math-1.5B-Instruct"
 qwen_7b_ckpt="Qwen/Qwen2.5-Math-7B-Instruct"
 
 output_dir="results"
-tag="math-1.5-instruct"
+tag=""
 
 CMD_PREFIX=""
 limit=null
+gpu_id=0
 if [ "$mode" = "debug" ]; then
+    echo "In DEBUG mode"
     CMD_PREFIX="python -m debugpy --listen 0.0.0.0:5678 --wait-for-client"
     output_dir="results_debug"
     limit=2
-    echo "In DEBUG mode"
 elif [ "$mode" = "launch" ]; then
-    CMD_PREFIX="srun python"
     echo "In LAUNCH mode"
+    CMD_PREFIX="srun python"
+    gpu_id=0
+    limit=null
 else
     CMD_PREFIX="python"
 fi
 
-gpu_id=0
 CUDA_VISIBLE_DEVICES=${gpu_id} \
 ${CMD_PREFIX} \
     eval_mp.py \

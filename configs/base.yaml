@@ -22,6 +22,7 @@ kv_window: null            # W
 max_lookahead: null        # M
 apd_mixture_weight: null   # R
 
+n_parallel_lanes: null
 n_parallel_samples: null
 max_unmask: null
 

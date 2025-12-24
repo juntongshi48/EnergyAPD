@@ -36,6 +36,7 @@ logger = logging.get_logger(__name__)
 
 import time
 import os
+import numpy as np
 
 PRINT_PROFILE=False
 
@@ -177,6 +178,16 @@ def energy_resample(x0, accept, num_accept, diffusion_logits, verifier_logits):
     
     return selected_index.item()
 
+def compute_energy(x0, accept, num_accept, diffusion_logits, verifier_logits):
+    p_theta = torch.gather(diffusion_logits, dim=-1, index=x0.unsqueeze(-1)).squeeze(-1) #(K, seqlen)
+    p_theta = (p_theta*accept).sum(-1) / num_accept
+    p_verifier = torch.gather(verifier_logits, dim=-1, index=x0.unsqueeze(-1)).squeeze(-1)
+    p_verifier = (p_verifier*accept).sum(-1) / num_accept
+    
+    energy = p_verifier - p_theta
+    
+    return energy
+
 @dataclass
 class DreamModelOutput(ModelOutput):
     sequences: torch.LongTensor = None
@@ -190,6 +201,7 @@ class ProfileOutput(ModelOutput):
     total_time: float = None
     detailed_time: Dict[str, float] = None
     acceptance_counts: List[int] = None
+    chosen_lane_id: List = None
     
     
 @dataclass
@@ -217,6 +229,7 @@ class DreamGenerationConfig(GenerationConfig):
         self.max_lookahead: Optional[int] = kwargs.pop("max_lookahead", None)
         self.apd_mixture_weight: Optional[float] = kwargs.pop("apd_mixture_weight", None)
         self.n_parallel_samples: Optional[int] = kwargs.pop("n_parallel_samples", None)
+        self.n_parallel_lanes: Optional[int] = kwargs.pop("n_parallel_lanes", None)
         self.max_unmask: Optional[int] = kwargs.pop("max_unmask", None)
         
 
@@ -861,6 +874,362 @@ class DreamGenerationMixin:
             total_time=total_time,
             detailed_time=detailed_time,
             acceptance_counts=acceptance_counts,
+        )
+        
+        if return_dict_in_generate:
+            return DreamModelOutputWithProfile(
+                sequences=x,
+                profile=profile
+            )
+        else:
+            return x
+        
+    def smc_sample(
+        self,
+        input_ids: torch.LongTensor,
+        attention_mask: Optional[torch.LongTensor],
+        generation_config: DreamGenerationConfig,
+        generation_tokens_hook_func,
+        generation_logits_hook_func,
+        verifier_model
+    ) -> Union[DreamModelOutput, torch.LongTensor]:
+        
+        total_time =  time.time()
+        num_forward_evals = 0
+        num_tokens_generated = 0
+        total_verification_time = 0
+        acceptance_counts = []
+        chosen_lane_id = []
+        
+        
+        # init values
+        output_history = generation_config.output_history
+        return_dict_in_generate = generation_config.return_dict_in_generate
+        max_length = generation_config.max_length
+        mask_token_id = generation_config.mask_token_id
+        temperature = generation_config.temperature
+        top_p = generation_config.top_p
+        top_k = generation_config.top_k
+        tokens_per_step = generation_config.tokens_per_step
+        kv_window = generation_config.kv_window
+        max_lookahead = generation_config.max_lookahead
+        apd_mixture_weight = generation_config.apd_mixture_weight
+        n_parallel_samples = generation_config.n_parallel_samples
+        n_parallel_lanes = generation_config.n_parallel_lanes
+        max_unmask = generation_config.max_unmask
+
+        # pad input_ids to max_length
+        x = F.pad(input_ids, (0, max_length - input_ids.shape[1]), value=mask_token_id)
+        lanes_x = x.repeat(n_parallel_lanes, 1)    # (#lanes, seqlen)
+        new_lanes_x = lanes_x.clone()
+        
+        if attention_mask is not None and torch.any(attention_mask == 0.0):
+            # we do not mask the [MASK] tokens so value = 1.0
+            attention_mask = F.pad(attention_mask, (0, max_length - attention_mask.shape[1]), value=1.0)
+            tok_idx = attention_mask.long().cumsum(-1) - 1
+            tok_idx.masked_fill_(attention_mask == 0, 1)
+            # attention_mask is of shape [B, N]
+            # broadcast to [B, 1, N, N]
+            attention_mask = torch.logical_and(
+                attention_mask.unsqueeze(1).unsqueeze(-2),
+                attention_mask.unsqueeze(1).unsqueeze(-1),
+            )
+        else:
+            tok_idx = None
+            attention_mask = "full"
+
+
+        # this allows user-defined token control of the intermediate steps
+        generation_tokens_hook_func(None, lanes_x, None)    #TODO: not safe
+        
+        # indices = (x == mask_token_id).nonzero()
+        # masked_indices, _ = torch.unique(indices[:, 1], return_inverse=True)
+        # curr_idx = masked_indices[0].item()
+        curr_indices = (lanes_x != mask_token_id).sum(-1).tolist()
+        new_curr_indices = curr_indices.copy()
+        is_prefilling = True
+        
+        n_finished_lanes = 0
+        lanes_prev_logits = [None] * n_parallel_lanes
+        lanes_verifier_logits = [None] * n_parallel_lanes
+        lanes_diffusion_past_key_values = [None] * n_parallel_lanes
+        lanes_temp_diffusion_past_key_values = [None] * n_parallel_lanes
+        lanes_verifier_past_key_values = [None] * n_parallel_lanes
+        lanes_temp_verifier_past_key_values = [None] * n_parallel_lanes
+        
+        lanes_x0 = [None] * n_parallel_lanes
+        lanes_energy = [None] * n_parallel_lanes
+        lanes_num_accept = [None] * n_parallel_lanes
+        lanes_num_token_generated = [0] * n_parallel_lanes
+        lanes_acceptance_count = [[] for _ in range(n_parallel_lanes)]
+        lanes_new_num_token_generated = [0] * n_parallel_lanes
+        lanes_new_acceptance_count = [[] for _ in range(n_parallel_lanes)]
+        final_x = [None] * n_parallel_lanes
+        final_num_token_generated = [0] * n_parallel_lanes
+        final_acceptance_count = [[] for _ in range(n_parallel_lanes)]
+        
+        all_cache_positions = torch.arange(lanes_x.shape[-1]).long().to(self.device)
+        
+        profile_parent_dir = "time_profiles"
+        if not os.path.exists(profile_parent_dir):
+            os.makedirs(profile_parent_dir)
+        profile_fn = f"N={n_parallel_samples}_U={max_unmask}_M={max_lookahead}_k={kv_window}.txt"
+        profile_path = os.path.join(profile_parent_dir, profile_fn)
+        my_timer = GPUTimer(log_file_path=profile_path)
+        detailed_time = {
+            "DLM forward": 0.0,
+            "sampling": 0.0,
+            "AR forward": 0.0,
+            "apd accept": 0.0,
+            "energy resample": 0.0
+        }
+        
+        # num_acc_fn = f"NumAccCounts_N={n_parallel_samples}_U={max_unmask}_M={max_lookahead}_K={kv_window}.txt"
+        # num_acc_path = os.path.join(profile_parent_dir, num_acc_fn)
+        
+        while any(curr_idx < lanes_x.shape[-1] for curr_idx in curr_indices):
+            if PRINT_PROFILE:
+                opening_msg = f"\n#### step={num_forward_evals}, curr_idx={[curr_idx for curr_idx in curr_indices]} ####"
+                print(opening_msg)
+                with open(profile_path, "a") as f:
+                    f.write(opening_msg + "\n")
+            
+            n_activate_lanes = n_parallel_lanes - n_finished_lanes
+            for lane_i in range(n_activate_lanes):
+                curr_idx = curr_indices[lane_i]
+                x = lanes_x[lane_i:lane_i+1, :] #(1, seqlen)
+                prev_logits = lanes_prev_logits[lane_i]
+                diffusion_past_key_values = lanes_diffusion_past_key_values[lane_i]
+                verifier_past_key_values = lanes_verifier_past_key_values[lane_i]
+                
+                if max_lookahead is not None:
+                    right_idx = min(curr_idx + max_lookahead, x.shape[-1])
+                else:
+                    right_idx = x.shape[-1]
+                    
+                if kv_window is not None: #and diffusion_past_key_values is not None:
+                    if diffusion_past_key_values is None:
+                        left_idx = 0
+                    else:
+                        left_idx = max(curr_idx - kv_window - num_accept + 1, 0) # Subtract num_accept to compute KV on newly sampled tokens
+                else:
+                    left_idx = 0
+                
+                truncated_x = x[:, left_idx:right_idx]
+                mask_index = (truncated_x == mask_token_id)
+
+                
+                cache_position = all_cache_positions[left_idx:right_idx] if diffusion_past_key_values is not None else None
+                position_ids = cache_position.unsqueeze(0) if cache_position is not None else None
+                
+                if diffusion_past_key_values is not None:
+                    diffusion_past_key_values.crop(left_idx)
+                
+                my_timer.start()
+                outputs = self(truncated_x, 
+                                attention_mask="full", 
+                                past_key_values=diffusion_past_key_values,
+                                cache_position=cache_position,
+                                position_ids=position_ids)
+                detailed_time['DLM forward'] += my_timer.end(f"{num_forward_evals } DLM forward") * 1e-3
+                
+                logits = outputs.logits
+                logits = torch.cat([logits[:,:1], logits[:, :-1]], dim=1)
+                
+                diffusion_past_key_values = outputs.past_key_values if kv_window is not None else None
+                lanes_temp_diffusion_past_key_values[lane_i] = diffusion_past_key_values
+                
+                num_forward_evals += 1
+
+                # this allows user-defined logits control of the intermediate steps
+                generation_logits_hook_func(curr_idx, x, None)
+                mask_logits = logits[mask_index]
+                
+                if max_unmask is not None:
+                    mask_logits = mask_logits[:max_unmask, :]
+                    right_idx = min(curr_idx + max_unmask, x.shape[-1])
+                mask_logits = mask_logits.unsqueeze(0).repeat(n_parallel_samples, 1, 1)
+                
+                my_timer.start()
+                gumbel_noise, x0 = sample_with_gumbel(mask_logits, temperature=temperature, top_p=top_p, top_k=top_k)  #(K, seqlen, V), (K, seqlen)
+                detailed_time["sampling"] += my_timer.end(f"{num_forward_evals } sampling") * 1e-3
+                
+                # diffusion_logits = mask_logits[:, :, :151936].unsqueeze(0) #Restrict to vocab of qwen
+                diffusion_logits = mask_logits[:, :, :151936] #Restrict to vocab of qwen
+                
+                # Verification begins
+                verification_time = time.time()
+                
+                if is_prefilling:
+                    
+                    draft = x.clone()[:, :right_idx]
+                    draft = draft.repeat(n_parallel_samples, 1)
+                    draft[:, curr_idx:right_idx] = x0
+                    cache_position = None
+                    attention_mask = None
+                    position_ids = None
+                else:
+                    # draft = x0.clone().unsqueeze(0)
+                    draft = x0.clone()
+                    cache_position = all_cache_positions[curr_idx:right_idx]
+                    position_ids = cache_position.unsqueeze(0)
+                    
+                my_timer.start()
+                verifier_outputs = verifier_model(draft, 
+                                                    past_key_values=verifier_past_key_values,
+                                                    cache_position=cache_position,
+                                                    position_ids=position_ids) 
+                detailed_time["AR forward"] += my_timer.end(f"{num_forward_evals } AR forward") * 1e-3
+                total_verification_time += time.time() - verification_time
+                
+                verifier_past_key_values = verifier_outputs.past_key_values # (K, n_heads, seqlen, head_dim)
+                lanes_temp_verifier_past_key_values[lane_i] = verifier_past_key_values
+                
+                if is_prefilling:
+                    verifier_logits = verifier_outputs.logits[:, curr_idx-1:-1, :] #shift logits
+                    verifier_logits = verifier_logits[:, :, :151936]   # truncate special tokens
+                else:
+                    verifier_logits = verifier_outputs.logits
+                    verifier_logits = verifier_logits[:, :, :151936]   # truncate special tokens
+                    prev_logits = prev_logits.repeat(n_parallel_samples, 1, 1)
+                    verifier_logits = torch.cat([prev_logits, verifier_logits[:, :-1, :]], dim=1)
+                
+                if max_lookahead is not None:    
+                    verifier_logits = verifier_logits[:, :max_lookahead, :]
+                if max_unmask is not None:
+                    verifier_logits = verifier_logits[:, :max_unmask, :]
+                lanes_verifier_logits[lane_i] = verifier_logits
+
+                my_timer.start()
+                accept = apd_accept_criterion(draft, diffusion_logits, verifier_logits, gumbel_noise, apd_mixture_weight)
+                detailed_time["apd accept"] += my_timer.end(f"{num_forward_evals } apd accept") * 1e-3
+
+                # num_accept = accept.sum().item()
+                # num_accept = min(num_accept, x0.shape[-1])
+                num_accept = accept.sum(-1)
+                if torch.any(num_accept > x0.shape[-1]).item():
+                    import pdb; pdb.set_trace()
+                # num_accept = num_accept.clamp(max=x0.shape[-1])
+                # accept_mask = (torch.arange(accept.shape[-1], device=accept.device, dtype=accept.dtype) < x0.shape[-1])
+                # accept = accept * accept_mask
+
+                lanes_x0[lane_i] = x0
+                lanes_num_accept[lane_i] = num_accept
+                my_timer.start()
+                energy = compute_energy(x0, accept, num_accept, diffusion_logits, verifier_logits)
+                lanes_energy[lane_i] = energy
+                detailed_time["energy resample"] += my_timer.end(f"{num_forward_evals } energy resample") * 1e-3
+            
+            is_prefilling = False
+            # Resample lanes based on energy
+            all_energy = torch.stack(lanes_energy[:n_activate_lanes], dim=0)   #(n_activate_lanes, n_parallel_samples)
+            all_energy = all_energy - all_energy.max()
+            flat_energy = all_energy.reshape(-1)
+            flat_weights = torch.softmax(flat_energy, dim=-1)
+            # flat_indices = torch.multinomial(flat_weights, num_samples=n_activate_lanes).squeeze(-1)
+            flat_indices = torch.topk(flat_weights, k=n_activate_lanes).indices
+            lane_indices = (flat_indices // n_parallel_samples).tolist()
+            sample_indices = (flat_indices % n_parallel_samples).tolist()
+            chosen_lane_id.append(flat_indices.tolist())
+            
+            new_lane_idx=0
+            for lane_idx, sample_idx in zip(lane_indices, sample_indices):
+                x = lanes_x[lane_idx:lane_idx+1, :].clone()
+                x0 = lanes_x0[lane_idx]
+                num_accept = lanes_num_accept[lane_idx]
+                curr_idx = curr_indices[lane_idx]
+                num_tokens_generated = lanes_num_token_generated[lane_idx]
+                acceptance_counts = lanes_acceptance_count[lane_idx].copy()
+                
+                # keep only the selected sample
+                num_accept = num_accept[sample_idx].item()
+                x0 = x0[sample_idx, :]
+                x[0, curr_idx:curr_idx+num_accept] = x0[:num_accept]
+                curr_idx += num_accept
+                num_tokens_generated += num_accept
+                acceptance_counts.append(num_accept)
+                
+                # this allows user-defined token control of the intermediate steps
+                generation_tokens_hook_func(curr_idx, x, acceptance_counts) # TODO: not safe
+                
+                no_mask = (x == mask_token_id).sum().item() == 0
+                has_eos = (x == generation_config.eos_token_id).sum().item() > 0
+                if no_mask or has_eos:
+                    final_x[n_finished_lanes] = x
+                    final_num_token_generated[n_finished_lanes] = num_tokens_generated
+                    final_acceptance_count[n_finished_lanes] = acceptance_counts
+                    n_finished_lanes += 1
+                else:
+                    new_lanes_x[new_lane_idx] = x[0]
+                    new_curr_indices[new_lane_idx] = curr_idx
+                    lanes_new_num_token_generated[new_lane_idx] = num_tokens_generated
+                    lanes_new_acceptance_count[new_lane_idx] = acceptance_counts
+                    my_timer.start()
+                    # diffusion_logits = diffusion_logits[sample_idx:sample_idx+1, :, :]
+                    verifier_logits = lanes_verifier_logits[lane_idx]
+                    verifier_logits = verifier_logits[sample_idx:sample_idx+1, :, :]
+                    if num_accept < verifier_logits.shape[1]:
+                        prev_logits = verifier_logits[:, num_accept, :].unsqueeze(1)
+                    else:
+                        prev_logits = verifier_logits[:, -1, :].unsqueeze(1)
+                    lanes_prev_logits[new_lane_idx] = prev_logits
+                    
+                    
+                    lanes_diffusion_past_key_values[new_lane_idx] = lanes_temp_diffusion_past_key_values[lane_idx]
+                    src = lanes_temp_verifier_past_key_values[lane_idx]
+                    dst = copy.copy(src)
+                    for i in range(len(src.layers)):
+                        dst.layers[i] = copy.copy(src.layers[i])
+                        k = src.layers[i].keys[sample_idx:sample_idx+1].clone()
+                        v = src.layers[i].values[sample_idx:sample_idx+1].clone()
+                        dst.layers[i].keys = k.repeat(n_parallel_samples, 1, 1, 1)
+                        dst.layers[i].values = v.repeat(n_parallel_samples, 1, 1, 1)
+                    dst.crop(curr_idx+num_accept)
+                    lanes_verifier_past_key_values[new_lane_idx] = dst
+                    my_timer.end(f"{num_forward_evals} clean up")
+                    new_lane_idx += 1
+            
+            if n_finished_lanes == n_parallel_lanes:
+                break
+            lanes_x = new_lanes_x
+            curr_indices = new_curr_indices.copy()
+            lanes_num_token_generated = lanes_new_num_token_generated.copy()
+            lanes_acceptance_count = lanes_new_acceptance_count.copy()
+            
+            
+             
+            # with open(num_acc_path, "a") as f:
+            #     f.write(f"{num_accept}\n")
+
+        # Choose the longest generation
+        best_lane_id = np.argmax(final_num_token_generated)
+        x = final_x[best_lane_id] #(1, seqlen)
+        num_tokens_generated = final_num_token_generated[best_lane_id]
+        acceptance_counts = final_acceptance_count[best_lane_id]
+        
+        if PRINT_PROFILE:
+            for i, (k, v) in enumerate(detailed_time.items()):
+                profile_msg = f"Total time for {k}: {v:.3f} seconds"
+                if i==0:
+                    profile_msg = "\n" + profile_msg
+                print(profile_msg)
+                with open(profile_path, "a") as f:
+                    f.write(profile_msg + "\n")
+        # import pdb; pdb.set_trace()
+            
+        total_time = time.time() - total_time
+        # Noramlize detailed time by the number of steps
+        for k, v in detailed_time.items():
+            detailed_time[k] = v/num_forward_evals 
+        
+        profile = ProfileOutput(
+            num_forward_evals=num_forward_evals,
+            num_tokens_generated=num_tokens_generated,
+            verification_time=total_verification_time,
+            total_time=total_time,
+            detailed_time=detailed_time,
+            acceptance_counts=acceptance_counts,
+            chosen_lane_id=chosen_lane_id
         )
         
         if return_dict_in_generate:

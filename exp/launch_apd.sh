@@ -1,12 +1,12 @@
 file_to_launch="exp/batch_run_apd.sh"
 echo "Starting ${file_to_launch}"
 
-task=gsm8k
+task=math
 
 max_lookahead=(null)
 kv_window=(null)
-n_parallel_samples=(1 2 3 4 8)
-max_unmask=(32 null)
+n_parallel_samples=(1 2 4)
+max_unmask=(32)
 verifier_size=small
 
 for ml in "${max_lookahead[@]}"; do

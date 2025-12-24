@@ -481,26 +481,20 @@ class DreamGenerationMixin:
         )
 
         if generation_config.alg == "apd" or generation_config.alg == "leftright":
-            if generation_config.n_parallel_samples is not None and generation_config.n_parallel_samples > 1:
-                result = self.energy_apd_sample(
-                    input_ids,
-                    attention_mask=attention_mask,
-                    generation_config=generation_config,
-                    generation_tokens_hook_func=generation_tokens_hook_func,
-                    generation_logits_hook_func=generation_logits_hook_func,
-                    verifier_model=verifier_model
-                    
-                )
-            else:
-                result = self.energy_apd_sample(
-                    input_ids,
-                    attention_mask=attention_mask,
-                    generation_config=generation_config,
-                    generation_tokens_hook_func=generation_tokens_hook_func,
-                    generation_logits_hook_func=generation_logits_hook_func,
-                    verifier_model=verifier_model
-                    
-                )
+            sampling_func = self.apd_sample  # TODO: change back to apd_sample
+            if generation_config.n_parallel_samples is not None:
+                sampling_func = self.energy_apd_sample
+                if generation_config.n_parallel_lanes is not None:
+                    sampling_func = self.smc_sample
+            result = sampling_func(
+                input_ids,
+                attention_mask=attention_mask,
+                generation_config=generation_config,
+                generation_tokens_hook_func=generation_tokens_hook_func,
+                generation_logits_hook_func=generation_logits_hook_func,
+                verifier_model=verifier_model
+                
+            )
         else:
             result = self._sample(
                 input_ids,

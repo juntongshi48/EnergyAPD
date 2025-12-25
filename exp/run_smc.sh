@@ -29,7 +29,7 @@ qwen_small_ckpt="Qwen/Qwen2.5-Math-1.5B-Instruct"
 qwen_7b_ckpt="Qwen/Qwen2.5-Math-7B-Instruct"
 
 n_parallel_samples=2
-n_parallel_lanes=null
+n_parallel_lanes=1
 max_unmask=32
 
 output_dir="results"

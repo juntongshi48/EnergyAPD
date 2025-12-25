@@ -1178,7 +1178,7 @@ class DreamGenerationMixin:
                         v = src.layers[i].values[sample_idx:sample_idx+1].clone()
                         dst.layers[i].keys = k.repeat(n_parallel_samples, 1, 1, 1)
                         dst.layers[i].values = v.repeat(n_parallel_samples, 1, 1, 1)
-                    dst.crop(curr_idx+num_accept)
+                    dst.crop(curr_idx)
                     lanes_verifier_past_key_values[new_lane_idx] = dst
                     my_timer.end(f"{num_forward_evals} clean up")
                     new_lane_idx += 1

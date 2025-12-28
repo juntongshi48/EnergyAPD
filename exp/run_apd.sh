@@ -11,10 +11,14 @@
 #SBATCH --output=sout/eval_gsm8k\_%j.out  # Output file (%j expands to jobID)
 # )
 
-source /atlas2/u/minkai/miniconda3/etc/profile.d/conda.sh
+source /dfs/user/minkai/miniconda3/etc/profile.d/conda.sh
 conda activate apd
 
 echo "Hostname: $(hostname)"
+
+export HF_HOME=/dfs/user/minkai/.cache/huggingface
+export TRANSFORMERS_CACHE=/dfs/user/minkai/.cache/huggingface/transformers
+export HF_HUB_CACHE=/dfs/user/minkai/.cache/huggingface/hub
 
 mode=$1
 
@@ -28,7 +32,7 @@ verifier_size="small"
 qwen_small_ckpt="Qwen/Qwen2.5-Math-1.5B-Instruct"
 qwen_7b_ckpt="Qwen/Qwen2.5-Math-7B-Instruct"
 
-n_parallel_samples=2
+n_parallel_samples=1
 n_parallel_lanes=null
 max_unmask=32
 
@@ -37,7 +41,7 @@ tag="greedy"
 
 CMD_PREFIX=""
 limit=null
-gpu_id=0
+gpu_id=5
 if [ "$mode" = "debug" ]; then
     echo "In DEBUG mode"
     CMD_PREFIX="python -m debugpy --listen 0.0.0.0:5678 --wait-for-client"

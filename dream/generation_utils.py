@@ -1185,7 +1185,7 @@ class DreamGenerationMixin:
             
             if n_finished_lanes == n_parallel_lanes:
                 break
-            lanes_x = new_lanes_x
+            lanes_x = new_lanes_x.clone()
             curr_indices = new_curr_indices.copy()
             lanes_num_token_generated = lanes_new_num_token_generated.copy()
             lanes_acceptance_count = lanes_new_acceptance_count.copy()

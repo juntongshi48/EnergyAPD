@@ -269,7 +269,7 @@ def plot_chosen_lane_id(hashed_chosen_lane_id, save_path):
 
     plt.figure()
     plt.bar(xs, ys)
-    plt.xlabel("Chose Lane ID")
+    plt.xlabel("Chosen Lane ID")
     plt.ylabel("Percentage (%)")
     plt.title("Histogram of Chosen Lane ID (%)")
     plt.savefig(save_path)
